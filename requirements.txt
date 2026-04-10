@@ -1,0 +1,18 @@
+# ── Core scraping ──────────────────────────────────────────────────────────
+playwright==1.44.0          # Async browser automation (Chromium)
+
+# ── Data handling ───────────────────────────────────────────────────────────
+pandas==2.2.2
+openpyxl==3.1.4             # Excel read/write with styling
+
+# ── Frontend ────────────────────────────────────────────────────────────────
+streamlit==1.35.0
+
+# ── Utilities ───────────────────────────────────────────────────────────────
+# (stdlib: asyncio, re, logging, dataclasses, io, pathlib — no extra install)
+
+# ── Future / optional extensions ────────────────────────────────────────────
+# spacy>=3.7                # NLP analysis
+# supabase>=2.0             # Database integration
+# apscheduler>=3.10         # Scheduled scraping
+# httpx>=0.27              # Lightweight HTTP for non-JS pages
