@@ -227,8 +227,6 @@ if "scraping" not in st.session_state:
 
 with st.sidebar:
     st.markdown("## 📌 Pinterest Scraper")
-    #st.markdown("---")
-
     keyword = st.text_input(
         "🔍 Keyword / Niche",
         placeholder="e.g. fitness motivation",
