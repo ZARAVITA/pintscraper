@@ -1,11 +1,13 @@
 """
-Pinterest Scraper Module — v3
-Uses Playwright to scrape Pinterest search results dynamically.
+Pinterest Scraper Module — v4
+Playwright-based async scraper.
 
-Fixes v3:
-    - Auto-détection du chemin Chromium (résout le version mismatch playwright)
-    - Messages d'erreur toujours visibles (plus jamais vides)
-    - nest_asyncio pour la compatibilité Streamlit
+Compatibilité :
+    - Windows local     : auto-détection chromium-*/chrome-win/chrome.exe
+    - macOS local       : auto-détection chromium-*/Chromium.app
+    - Linux local       : auto-détection chromium-*/chrome-linux/chrome
+    - Streamlit Cloud   : /usr/bin/chromium (paquet système via packages.txt)
+    - Docker            : /usr/bin/chromium-browser
 """
 
 import asyncio
@@ -21,72 +23,74 @@ from urllib.parse import quote_plus
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Fix critique : nest_asyncio pour compatibilité Streamlit
+# nest_asyncio — fix Streamlit event loop
 # ---------------------------------------------------------------------------
 try:
     import nest_asyncio
     nest_asyncio.apply()
 except ImportError:
-    logger.warning("nest_asyncio non installé. Lancez : pip install nest_asyncio")
+    logger.warning("nest_asyncio non installé.")
 
 
 # ---------------------------------------------------------------------------
-# Auto-détection du chemin Chromium — résout le version mismatch
+# Auto-détection Chromium — couvre tous les environnements
 # ---------------------------------------------------------------------------
 
 def _find_chromium_executable() -> Optional[str]:
     """
-    Cherche le binaire Chromium dans tous les emplacements connus.
-    Résout le problème : Playwright 1.44 cherche chromium-1117
-    mais la version installée peut être différente (ex: 1194).
-
-    Retourne le premier chemin valide, ou None (Playwright utilisera son défaut).
+    Cherche Chromium dans l'ordre :
+    1. Variable PLAYWRIGHT_BROWSERS_PATH (tous OS)
+    2. /opt/pw-browsers/ et ~/.cache/ms-playwright/ (Linux/Mac)
+    3. AppData/Local/ms-playwright/ (Windows)
+    4. Chromium système — /usr/bin/chromium (Streamlit Cloud, Docker)
+    5. Google Chrome système
     """
     candidates = []
 
-    # 1. Via PLAYWRIGHT_BROWSERS_PATH (variable d'env)
+    # 1. PLAYWRIGHT_BROWSERS_PATH
     pw_path = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "")
     if pw_path:
         candidates.extend(sorted(glob.glob(f"{pw_path}/chromium-*/chrome-linux/chrome"), reverse=True))
-        candidates.extend(sorted(glob.glob(f"{pw_path}/chromium-*/chrome.exe"), reverse=True))
+        candidates.extend(sorted(glob.glob(f"{pw_path}/chromium-*/chrome-win/chrome.exe"), reverse=True))
+        candidates.extend(sorted(glob.glob(f"{pw_path}/chromium-*/chrome-mac/Chromium.app/Contents/MacOS/Chromium"), reverse=True))
 
-    # 2. Linux — /opt/pw-browsers (serveurs, Docker)
+    # 2. Linux — /opt/pw-browsers et ~/.cache/ms-playwright
     candidates.extend(sorted(glob.glob("/opt/pw-browsers/chromium-*/chrome-linux/chrome"), reverse=True))
-
-    # 3. Linux desktop — ~/.cache/ms-playwright
     home = str(Path.home())
     candidates.extend(sorted(glob.glob(f"{home}/.cache/ms-playwright/chromium-*/chrome-linux/chrome"), reverse=True))
 
-    # 4. macOS
+    # 3. macOS
     candidates.extend(sorted(glob.glob(f"{home}/Library/Caches/ms-playwright/chromium-*/chrome-mac/Chromium.app/Contents/MacOS/Chromium"), reverse=True))
 
-    # 5. Windows
+    # 4. Windows
     candidates.extend(sorted(glob.glob(f"{home}/AppData/Local/ms-playwright/chromium-*/chrome-win/chrome.exe"), reverse=True))
 
-    # 6. Chrome système (fallback)
-    system_browsers = [
-        "/opt/google/chrome/chrome",
+    # 5. Chromium système (Streamlit Cloud, Ubuntu, Debian, Docker)
+    system_paths = [
+        "/usr/bin/chromium",          # Streamlit Cloud (packages.txt)
+        "/usr/bin/chromium-browser",  # Ubuntu/Debian
+        "/snap/bin/chromium",         # Snap
         "/usr/bin/google-chrome",
         "/usr/bin/google-chrome-stable",
-        "/usr/bin/chromium-browser",
-        "/usr/bin/chromium",
-        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        "/opt/google/chrome/chrome",
+        # macOS
         "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
         "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        # Windows
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
     ]
-    candidates.extend(system_browsers)
+    candidates.extend(system_paths)
 
     for path in candidates:
         if path and os.path.isfile(path) and os.access(path, os.X_OK):
             logger.info("✅ Chromium trouvé : %s", path)
             return path
 
-    logger.warning("⚠️ Aucun Chromium trouvé automatiquement — Playwright utilisera son chemin par défaut.")
+    logger.warning("⚠️ Aucun Chromium trouvé — Playwright utilisera son défaut.")
     return None
 
 
-# Détection au chargement du module (une seule fois)
 CHROMIUM_PATH = _find_chromium_executable()
 
 
@@ -96,7 +100,6 @@ CHROMIUM_PATH = _find_chromium_executable()
 
 @dataclass
 class Pin:
-    """Représente un pin Pinterest avec toutes ses métadonnées."""
     keyword: str
     title: str
     description: str
@@ -117,7 +120,6 @@ class PinterestScraper:
 
     SELECTORS = {
         "pin_link": "a[href*='/pin/']",
-        "image": "img",
     }
 
     def __init__(
@@ -138,7 +140,6 @@ class PinterestScraper:
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/124.0.0.0 Safari/537.36"
         )
-        # chromium_path : explicite > auto-détecté > None (Playwright défaut)
         self.chromium_path = chromium_path or CHROMIUM_PATH
 
     async def scrape(
@@ -157,8 +158,7 @@ class PinterestScraper:
             )
 
         url = self.BASE_URL.format(query=quote_plus(keyword))
-        logger.info("Scraping URL : %s", url)
-        logger.info("Chromium utilisé : %s", self.chromium_path or "chemin par défaut Playwright")
+        logger.info("Scraping : %s | Chromium : %s", url, self.chromium_path or "défaut Playwright")
 
         async with async_playwright() as pw:
             launch_kwargs: dict = dict(
@@ -167,6 +167,8 @@ class PinterestScraper:
                     "--no-sandbox",
                     "--disable-dev-shm-usage",
                     "--disable-blink-features=AutomationControlled",
+                    "--disable-gpu",
+                    "--single-process",
                 ],
             )
             if self.chromium_path:
@@ -177,9 +179,9 @@ class PinterestScraper:
             except Exception as exc:
                 raise RuntimeError(
                     f"Impossible de lancer Chromium.\n"
-                    f"Chemin utilisé : {self.chromium_path or 'défaut Playwright'}\n"
-                    f"→ Lancez 'playwright install chromium' dans votre terminal.\n"
-                    f"Erreur technique : {exc}"
+                    f"Chemin : {self.chromium_path or 'défaut Playwright'}\n"
+                    f"→ Vérifiez que Chromium est installé.\n"
+                    f"Erreur : {exc}"
                 )
 
             context = await browser.new_context(
@@ -196,11 +198,10 @@ class PinterestScraper:
             try:
                 await page.goto(url, timeout=self.timeout_ms, wait_until="domcontentloaded")
                 await page.wait_for_timeout(3_000)
-
-                logger.info("URL après chargement : %s | Titre : %s", page.url, await page.title())
+                logger.info("URL: %s | Titre: %s", page.url, await page.title())
 
                 if "login" in page.url.lower():
-                    logger.warning("Pinterest a redirigé vers login — essayez headless=False")
+                    logger.warning("Pinterest redirigé vers login.")
 
                 await self._dismiss_overlays(page)
                 pins = await self._collect_pins(page, keyword, max_pins, progress_callback)
@@ -238,7 +239,7 @@ class PinterestScraper:
         try:
             await page.wait_for_selector(self.SELECTORS["pin_link"], timeout=15_000)
         except Exception:
-            logger.warning("Timeout sélecteur pins — possible login wall ou page vide.")
+            logger.warning("Timeout sélecteur pins.")
 
         while len(pins) < max_pins and stall_count < self.max_scroll_attempts:
             raw_pins = await self._extract_pins_from_page(page, keyword)
@@ -260,9 +261,7 @@ class PinterestScraper:
                 if len(pins) >= max_pins:
                     break
 
-            logger.debug("Scroll %d : +%d pins (total %d/%d)", stall_count, newly_added, len(pins), max_pins)
             stall_count = 0 if newly_added > 0 else stall_count + 1
-
             if len(pins) >= max_pins:
                 break
 
@@ -284,8 +283,8 @@ class PinterestScraper:
                 pin = await self._parse_pin_element(el, keyword)
                 if pin:
                     pins.append(pin)
-            except Exception as exc:
-                logger.debug("Parse pin : %s", exc)
+            except Exception:
+                pass
         return pins
 
     async def _parse_pin_element(self, el, keyword) -> Optional[Pin]:
@@ -328,19 +327,11 @@ class PinterestScraper:
         )
 
 
-# ---------------------------------------------------------------------------
-# Utilitaires
-# ---------------------------------------------------------------------------
-
 def _clean_text(text: str) -> str:
     if not text:
         return ""
     return re.sub(r"\s+", " ", text).strip()
 
-
-# ---------------------------------------------------------------------------
-# Wrapper synchrone — compatible Streamlit
-# ---------------------------------------------------------------------------
 
 def scrape_sync(
     keyword: str,
