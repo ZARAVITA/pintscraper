@@ -1,20 +1,93 @@
 """
-Pinterest Scraper Module
+Pinterest Scraper Module — v3
 Uses Playwright to scrape Pinterest search results dynamically.
-Designed to be extended with authentication, proxies, or multi-keyword support.
+
+Fixes v3:
+    - Auto-détection du chemin Chromium (résout le version mismatch playwright)
+    - Messages d'erreur toujours visibles (plus jamais vides)
+    - nest_asyncio pour la compatibilité Streamlit
 """
 
 import asyncio
+import glob
 import logging
+import os
 import re
-import time
 from dataclasses import dataclass, field
-from typing import Optional
+from pathlib import Path
+from typing import Optional, Callable
 from urllib.parse import quote_plus
 
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
-
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Fix critique : nest_asyncio pour compatibilité Streamlit
+# ---------------------------------------------------------------------------
+try:
+    import nest_asyncio
+    nest_asyncio.apply()
+except ImportError:
+    logger.warning("nest_asyncio non installé. Lancez : pip install nest_asyncio")
+
+
+# ---------------------------------------------------------------------------
+# Auto-détection du chemin Chromium — résout le version mismatch
+# ---------------------------------------------------------------------------
+
+def _find_chromium_executable() -> Optional[str]:
+    """
+    Cherche le binaire Chromium dans tous les emplacements connus.
+    Résout le problème : Playwright 1.44 cherche chromium-1117
+    mais la version installée peut être différente (ex: 1194).
+
+    Retourne le premier chemin valide, ou None (Playwright utilisera son défaut).
+    """
+    candidates = []
+
+    # 1. Via PLAYWRIGHT_BROWSERS_PATH (variable d'env)
+    pw_path = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "")
+    if pw_path:
+        candidates.extend(sorted(glob.glob(f"{pw_path}/chromium-*/chrome-linux/chrome"), reverse=True))
+        candidates.extend(sorted(glob.glob(f"{pw_path}/chromium-*/chrome.exe"), reverse=True))
+
+    # 2. Linux — /opt/pw-browsers (serveurs, Docker)
+    candidates.extend(sorted(glob.glob("/opt/pw-browsers/chromium-*/chrome-linux/chrome"), reverse=True))
+
+    # 3. Linux desktop — ~/.cache/ms-playwright
+    home = str(Path.home())
+    candidates.extend(sorted(glob.glob(f"{home}/.cache/ms-playwright/chromium-*/chrome-linux/chrome"), reverse=True))
+
+    # 4. macOS
+    candidates.extend(sorted(glob.glob(f"{home}/Library/Caches/ms-playwright/chromium-*/chrome-mac/Chromium.app/Contents/MacOS/Chromium"), reverse=True))
+
+    # 5. Windows
+    candidates.extend(sorted(glob.glob(f"{home}/AppData/Local/ms-playwright/chromium-*/chrome-win/chrome.exe"), reverse=True))
+
+    # 6. Chrome système (fallback)
+    system_browsers = [
+        "/opt/google/chrome/chrome",
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/chromium-browser",
+        "/usr/bin/chromium",
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    ]
+    candidates.extend(system_browsers)
+
+    for path in candidates:
+        if path and os.path.isfile(path) and os.access(path, os.X_OK):
+            logger.info("✅ Chromium trouvé : %s", path)
+            return path
+
+    logger.warning("⚠️ Aucun Chromium trouvé automatiquement — Playwright utilisera son chemin par défaut.")
+    return None
+
+
+# Détection au chargement du module (une seule fois)
+CHROMIUM_PATH = _find_chromium_executable()
 
 
 # ---------------------------------------------------------------------------
@@ -23,49 +96,38 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class Pin:
-    """Represents a single Pinterest pin with all extracted metadata."""
+    """Représente un pin Pinterest avec toutes ses métadonnées."""
     keyword: str
     title: str
     description: str
     pin_url: str
     image_url: str
     position: int
-    # Filled later by scoring module
     score: float = 0.0
-    # Future: board_name, repins, saves, creator, etc.
     extra: dict = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
-# Scraper class
+# Scraper
 # ---------------------------------------------------------------------------
 
 class PinterestScraper:
-    """
-    Async scraper for Pinterest search results using Playwright.
-
-    Usage:
-        scraper = PinterestScraper(headless=True)
-        pins = await scraper.scrape(keyword="fitness", max_pins=50)
-    """
 
     BASE_URL = "https://www.pinterest.com/search/pins/?q={query}&rs=typed"
 
-    # CSS selectors — Pinterest changes its DOM frequently; centralise them here.
     SELECTORS = {
-        "pin_container": "[data-test-id='pin']",
         "pin_link": "a[href*='/pin/']",
         "image": "img",
-        "title": "[data-test-id='pin-title'], h3, [aria-label]",
     }
 
     def __init__(
         self,
         headless: bool = True,
-        timeout_ms: int = 30_000,
-        scroll_pause_ms: int = 2_000,
-        max_scroll_attempts: int = 20,
+        timeout_ms: int = 45_000,
+        scroll_pause_ms: int = 2_500,
+        max_scroll_attempts: int = 25,
         user_agent: Optional[str] = None,
+        chromium_path: Optional[str] = None,
     ):
         self.headless = headless
         self.timeout_ms = timeout_ms
@@ -76,202 +138,185 @@ class PinterestScraper:
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/124.0.0.0 Safari/537.36"
         )
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+        # chromium_path : explicite > auto-détecté > None (Playwright défaut)
+        self.chromium_path = chromium_path or CHROMIUM_PATH
 
     async def scrape(
         self,
         keyword: str,
         max_pins: int = 50,
-        progress_callback=None,
+        progress_callback: Optional[Callable] = None,
     ) -> list[Pin]:
-        """
-        Main entry point. Returns a list of Pin objects.
 
-        Args:
-            keyword: Search term.
-            max_pins: Target number of pins (actual count may differ slightly).
-            progress_callback: Optional callable(current, total) for UI updates.
-        """
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError:
+            raise RuntimeError(
+                "Playwright non installé.\n"
+                "Lancez : pip install playwright && playwright install chromium"
+            )
+
         url = self.BASE_URL.format(query=quote_plus(keyword))
-        pins: list[Pin] = []
+        logger.info("Scraping URL : %s", url)
+        logger.info("Chromium utilisé : %s", self.chromium_path or "chemin par défaut Playwright")
 
         async with async_playwright() as pw:
-            browser = await pw.chromium.launch(headless=self.headless)
+            launch_kwargs: dict = dict(
+                headless=self.headless,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-blink-features=AutomationControlled",
+                ],
+            )
+            if self.chromium_path:
+                launch_kwargs["executable_path"] = self.chromium_path
+
+            try:
+                browser = await pw.chromium.launch(**launch_kwargs)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Impossible de lancer Chromium.\n"
+                    f"Chemin utilisé : {self.chromium_path or 'défaut Playwright'}\n"
+                    f"→ Lancez 'playwright install chromium' dans votre terminal.\n"
+                    f"Erreur technique : {exc}"
+                )
+
             context = await browser.new_context(
                 user_agent=self.user_agent,
-                viewport={"width": 1280, "height": 900},
+                viewport={"width": 1366, "height": 900},
                 locale="en-US",
+                extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+            )
+            await context.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
             )
             page = await context.new_page()
 
             try:
-                logger.info("Navigating to %s", url)
                 await page.goto(url, timeout=self.timeout_ms, wait_until="domcontentloaded")
+                await page.wait_for_timeout(3_000)
 
-                # Dismiss cookie / login dialogs if they appear
+                logger.info("URL après chargement : %s | Titre : %s", page.url, await page.title())
+
+                if "login" in page.url.lower():
+                    logger.warning("Pinterest a redirigé vers login — essayez headless=False")
+
                 await self._dismiss_overlays(page)
+                pins = await self._collect_pins(page, keyword, max_pins, progress_callback)
 
-                pins = await self._collect_pins(
-                    page, keyword, max_pins, progress_callback
-                )
-
-            except PlaywrightTimeoutError as exc:
-                logger.error("Page load timeout: %s", exc)
             except Exception as exc:
-                logger.error("Unexpected scraping error: %s", exc, exc_info=True)
+                logger.error("Erreur scraping : %s", exc, exc_info=True)
+                raise
             finally:
                 await browser.close()
 
         return pins
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
     async def _dismiss_overlays(self, page) -> None:
-        """Attempt to close login prompts or cookie banners."""
-        close_selectors = [
+        for sel in [
             "[data-test-id='closeup-close-button']",
             "button[aria-label='Close']",
+            "button[aria-label='close']",
             "[data-test-id='cookie-banner'] button",
-        ]
-        for sel in close_selectors:
+            "div[role='dialog'] button",
+        ]:
             try:
                 btn = page.locator(sel).first
-                if await btn.is_visible(timeout=2_000):
+                if await btn.is_visible(timeout=1_500):
                     await btn.click()
-                    await page.wait_for_timeout(500)
+                    await page.wait_for_timeout(400)
             except Exception:
                 pass
 
-    async def _collect_pins(
-        self,
-        page,
-        keyword: str,
-        max_pins: int,
-        progress_callback,
-    ) -> list[Pin]:
-        """
-        Scroll the page progressively and extract pins until max_pins is reached
-        or no new content appears.
-        """
+    async def _collect_pins(self, page, keyword, max_pins, progress_callback):
         seen_urls: set[str] = set()
         pins: list[Pin] = []
-        scroll_attempts = 0
+        stall_count = 0
         position = 1
 
-        await page.wait_for_timeout(3_000)  # Let initial pins render
+        try:
+            await page.wait_for_selector(self.SELECTORS["pin_link"], timeout=15_000)
+        except Exception:
+            logger.warning("Timeout sélecteur pins — possible login wall ou page vide.")
 
-        while len(pins) < max_pins and scroll_attempts < self.max_scroll_attempts:
-            # Extract pins currently visible in DOM
+        while len(pins) < max_pins and stall_count < self.max_scroll_attempts:
             raw_pins = await self._extract_pins_from_page(page, keyword)
-
             newly_added = 0
+
             for raw in raw_pins:
-                if raw.pin_url in seen_urls:
+                if not raw.pin_url or raw.pin_url in seen_urls:
                     continue
                 seen_urls.add(raw.pin_url)
                 raw.position = position
                 pins.append(raw)
                 position += 1
                 newly_added += 1
-
                 if progress_callback:
-                    progress_callback(len(pins), max_pins)
-
+                    try:
+                        progress_callback(len(pins), max_pins)
+                    except Exception:
+                        pass
                 if len(pins) >= max_pins:
                     break
 
-            logger.debug(
-                "Scroll %d: found %d new pins (total %d / %d)",
-                scroll_attempts, newly_added, len(pins), max_pins,
-            )
+            logger.debug("Scroll %d : +%d pins (total %d/%d)", stall_count, newly_added, len(pins), max_pins)
+            stall_count = 0 if newly_added > 0 else stall_count + 1
 
-            if newly_added == 0:
-                scroll_attempts += 1
-            else:
-                scroll_attempts = 0  # reset stall counter on progress
+            if len(pins) >= max_pins:
+                break
 
-            # Scroll down to load more
-            await page.evaluate("window.scrollBy(0, window.innerHeight * 2)")
+            await page.evaluate("window.scrollBy(0, window.innerHeight * 2.5)")
             await page.wait_for_timeout(self.scroll_pause_ms)
 
-        logger.info("Collected %d pins for keyword '%s'", len(pins), keyword)
+        logger.info("Collecte terminée : %d pins pour '%s'", len(pins), keyword)
         return pins[:max_pins]
 
-    async def _extract_pins_from_page(self, page, keyword: str) -> list[Pin]:
-        """
-        Parse the current DOM state and return Pin objects for every
-        pin element found.
-        """
-        pins: list[Pin] = []
-
-        # Grab all anchor tags that point to a pin page
-        pin_elements = await page.query_selector_all("a[href*='/pin/']")
-
-        for el in pin_elements:
+    async def _extract_pins_from_page(self, page, keyword) -> list[Pin]:
+        pins = []
+        try:
+            elements = await page.query_selector_all(self.SELECTORS["pin_link"])
+        except Exception as exc:
+            logger.error("query_selector_all : %s", exc)
+            return pins
+        for el in elements:
             try:
                 pin = await self._parse_pin_element(el, keyword)
                 if pin:
                     pins.append(pin)
             except Exception as exc:
-                logger.debug("Failed to parse pin element: %s", exc)
-
+                logger.debug("Parse pin : %s", exc)
         return pins
 
-    async def _parse_pin_element(self, el, keyword: str) -> Optional[Pin]:
-        """
-        Extract data from a single anchor element.
-        Returns None if essential data is missing.
-        """
-        # --- Pin URL ---
+    async def _parse_pin_element(self, el, keyword) -> Optional[Pin]:
         href = await el.get_attribute("href") or ""
         if "/pin/" not in href:
             return None
-
         pin_url = href if href.startswith("http") else f"https://www.pinterest.com{href}"
 
-        # Deduplicate by URL at element level (full dedup is done above)
-        # --- Image URL ---
         img = await el.query_selector("img")
         image_url = ""
         if img:
-            # Prefer srcset (higher res) over src
             srcset = await img.get_attribute("srcset") or ""
             if srcset:
-                # Take the last (largest) URL from srcset
                 parts = [p.strip().split(" ")[0] for p in srcset.split(",") if p.strip()]
                 image_url = parts[-1] if parts else ""
             if not image_url:
                 image_url = await img.get_attribute("src") or ""
+            if image_url and "236x" in image_url:
+                image_url = image_url.replace("236x", "736x")
 
-        # --- Title ---
-        title = ""
-        aria_label = await el.get_attribute("aria-label") or ""
-        if aria_label:
-            title = aria_label.strip()
-
+        title = (await el.get_attribute("aria-label") or "").strip()
+        if not title and img:
+            title = (await img.get_attribute("alt") or "").strip()
         if not title:
-            # Try alt text on the image
-            if img:
-                title = (await img.get_attribute("alt") or "").strip()
-
-        if not title:
-            # Fallback: any visible text inside the anchor
             title = (await el.inner_text()).strip()[:120]
 
-        # Skip elements that aren't actual pins (e.g. navigation links)
         if not image_url and not title:
             return None
 
-        # --- Description ---
-        # Pinterest rarely exposes descriptions in search cards;
-        # we extract whatever text is visible beyond the title.
         raw_text = (await el.inner_text()).strip()
-        description = _extract_description(raw_text, title)
+        description = raw_text.replace(title, "", 1).strip()[:300] if title else raw_text[:300]
 
         return Pin(
             keyword=keyword,
@@ -279,46 +324,33 @@ class PinterestScraper:
             description=_clean_text(description),
             pin_url=pin_url,
             image_url=image_url,
-            position=0,  # assigned by caller
+            position=0,
         )
 
 
 # ---------------------------------------------------------------------------
-# Utility functions
+# Utilitaires
 # ---------------------------------------------------------------------------
 
 def _clean_text(text: str) -> str:
-    """Remove excess whitespace and non-printable characters."""
     if not text:
         return ""
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
-
-
-def _extract_description(raw_text: str, title: str) -> str:
-    """
-    Attempt to extract description by removing the title portion
-    from the raw inner text of the element.
-    """
-    if not raw_text or not title:
-        return ""
-    desc = raw_text.replace(title, "", 1).strip()
-    return desc[:300]  # Cap length
+    return re.sub(r"\s+", " ", text).strip()
 
 
 # ---------------------------------------------------------------------------
-# Sync wrapper (convenience for non-async callers)
+# Wrapper synchrone — compatible Streamlit
 # ---------------------------------------------------------------------------
 
-def scrape_sync(keyword: str, max_pins: int = 50, progress_callback=None) -> list[Pin]:
-    """
-    Synchronous wrapper around the async scraper.
-    Useful for Streamlit which runs in a sync context.
-    """
-    return asyncio.run(
-        PinterestScraper().scrape(
-            keyword=keyword,
-            max_pins=max_pins,
-            progress_callback=progress_callback,
-        )
+def scrape_sync(
+    keyword: str,
+    max_pins: int = 50,
+    headless: bool = True,
+    scroll_pause_ms: int = 2500,
+    progress_callback: Optional[Callable] = None,
+) -> list[Pin]:
+    scraper = PinterestScraper(headless=headless, scroll_pause_ms=scroll_pause_ms)
+    loop = asyncio.get_event_loop()
+    return loop.run_until_complete(
+        scraper.scrape(keyword=keyword, max_pins=max_pins, progress_callback=progress_callback)
     )
